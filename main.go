@@ -12,7 +12,6 @@
 package main
 
 import (
-	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -28,26 +27,26 @@ import (
 	"strings"
 	"time"
 
-	certificates "github.com/ericchiang/k8s/apis/certificates/v1beta1"
-
-	"github.com/ericchiang/k8s"
-	"github.com/ericchiang/k8s/apis/meta/v1"
-)
-
-var (
-	additionalDNSNames string
-	certDir            string
-	clusterDomain      string
-	hostname           string
-	namespace          string
-	podIP              string
-	podName            string
-	serviceIPs         string
-	serviceNames       string
-	subdomain          string
+  "k8s.io/apimachinery/pkg/apis/meta/v1"
+	certificates "k8s.io/api/certificates/v1beta1"
+	k8s "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 func main() {
+	var (
+		additionalDNSNames string
+		certDir            string
+		clusterDomain      string
+		hostname           string
+		namespace          string
+		podIP              string
+		podName            string
+		serviceIPs         string
+		serviceNames       string
+		subdomain          string
+	)
+
 	flag.StringVar(&additionalDNSNames, "additional-dnsnames", "", "additional dns names; comma separated")
 	flag.StringVar(&certDir, "cert-dir", "/etc/tls", "The directory where the TLS certs should be written")
 	flag.StringVar(&clusterDomain, "cluster-domain", "cluster.local", "Kubernetes cluster domain")
@@ -62,7 +61,12 @@ func main() {
 
 	certificateSigningRequestName := fmt.Sprintf("%s-%s", podName, namespace)
 
-	client, err := k8s.NewInClusterClient()
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		log.Fatalf("%#v", err)
+	}
+
+	client, err := k8s.NewForConfig(config)
 	if err != nil {
 		log.Fatalf("unable to create a Kubernetes client: %s", err)
 	}
@@ -163,18 +167,23 @@ func main() {
 	// Submit a certificate signing request, wait for it to be approved, then save
 	// the signed certificate to the file system.
 	certificateSigningRequest := &certificates.CertificateSigningRequest{
-		Metadata: &v1.ObjectMeta{
-			Name: k8s.String(certificateSigningRequestName),
-			Namespace: k8s.String(namespace),
+		ObjectMeta: v1.ObjectMeta{
+			Name:      certificateSigningRequestName,
+			Namespace: namespace,
 		},
-		Spec: &certificates.CertificateSigningRequestSpec{
-			Groups:   []string{"system:authenticated"},
-			Request:  certificateRequestBytes,
-			Usages: []string{"digital signature", "key encipherment", "server auth", "client auth"},
+		Spec: certificates.CertificateSigningRequestSpec{
+			Groups:  []string{"system:authenticated"},
+			Request: certificateRequestBytes,
+			Usages: []certificates.KeyUsage{
+				certificates.UsageDigitalSignature,
+				certificates.UsageKeyEncipherment,
+				certificates.UsageServerAuth,
+				certificates.UsageClientAuth,
+			},
 		},
 	}
 
-	err = client.Create(context.Background(), certificateSigningRequest)
+	_, err = client.CertificatesV1beta1().CertificateSigningRequests().Create(certificateSigningRequest)
 	if err != nil {
 		log.Fatalf("unable to create the certificate signing request: %s", err)
 	}
@@ -183,17 +192,16 @@ func main() {
 
 	log.Println("waiting for certificate...")
 	for {
-		var csr certificates.CertificateSigningRequest
-		err := client.Get(context.Background(), namespace, certificateSigningRequestName, &csr)
+		csr, err := client.CertificatesV1beta1().CertificateSigningRequests().Get(certificateSigningRequestName, v1.GetOptions{})
 		if err != nil {
 			log.Printf("unable to retrieve certificate signing request (%s): %s", certificateSigningRequestName, err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
 
-		if len(csr.GetStatus().GetConditions()) > 0 {
-			if *csr.GetStatus().GetConditions()[0].Type == "Approved" {
-				certificate = csr.GetStatus().Certificate
+		if len(csr.Status.Conditions) > 0 {
+			if csr.Status.Conditions[0].Type == certificates.CertificateApproved {
+				certificate = csr.Status.Certificate
 				break
 			}
 		}
